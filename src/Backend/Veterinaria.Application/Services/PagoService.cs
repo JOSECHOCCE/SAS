@@ -1,0 +1,385 @@
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using Microsoft.EntityFrameworkCore;
+using Veterinaria.Application.DTOs;
+using Veterinaria.Application.Interfaces;
+using Veterinaria.Domain.Contracts;
+using Veterinaria.Domain.Entities;
+
+namespace Veterinaria.Application.Services;
+
+public class PagoService : IPagoService
+{
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly IAuditoriaService _auditoriaService;
+
+    public PagoService(IUnitOfWork unitOfWork, IAuditoriaService auditoriaService)
+    {
+        _unitOfWork = unitOfWork;
+        _auditoriaService = auditoriaService;
+    }
+
+    public async Task<(List<Pago> Pagos, decimal TotalTarjeta, decimal TotalEfectivo, int TotalPagos)> GetPagosFiltradosAsync(string? tipoPago, string? metodoPago, DateTime? fechaDesde, DateTime? fechaHasta)
+    {
+        var query = _unitOfWork.Pagos.GetAll()
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Mascota)
+                    .ThenInclude(m => m.Usuario)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Veterinario)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Servicio)
+            .AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(tipoPago))
+            query = query.Where(p => p.TipoPago == tipoPago);
+
+        if (!string.IsNullOrWhiteSpace(metodoPago))
+            query = query.Where(p => p.MetodoPago == metodoPago);
+
+        if (fechaDesde.HasValue)
+            query = query.Where(p => p.FechaPago.Date >= fechaDesde.Value.Date);
+
+        if (fechaHasta.HasValue)
+            query = query.Where(p => p.FechaPago.Date <= fechaHasta.Value.Date);
+
+        var pagos = await query.OrderByDescending(p => p.FechaPago).ToListAsync();
+
+        var totalTarjeta = pagos.Where(p => p.MetodoPago == "Tarjeta").Sum(p => p.Monto);
+        var totalEfectivo = pagos.Where(p => p.MetodoPago == "Efectivo").Sum(p => p.Monto);
+        var totalPagos = pagos.Count;
+
+        return (pagos, totalTarjeta, totalEfectivo, totalPagos);
+    }
+
+    public async Task<Pago?> GetPagoDetailsAsync(int id)
+    {
+        var pago = await _unitOfWork.Pagos.GetAll()
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Mascota)
+                    .ThenInclude(m => m.Usuario)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Veterinario)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Servicio)
+            .FirstOrDefaultAsync(p => p.Id == id);
+
+        return pago;
+    }
+
+    public async Task<Cita?> GetCitaWithPagosAsync(int citaId)
+    {
+        return await _unitOfWork.Citas.GetAll()
+            .Include(c => c.Mascota)
+                .ThenInclude(m => m.Usuario)
+            .Include(c => c.Veterinario)
+            .Include(c => c.Servicio)
+            .Include(c => c.Pagos)
+            .FirstOrDefaultAsync(c => c.Id == citaId);
+    }
+
+    public async Task<ReportePagosDto> GetReportePagosAsync(DateTime fechaDesde, DateTime fechaHasta)
+    {
+        var query = _unitOfWork.Pagos.GetAll()
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Servicio)
+            .Where(p => p.FechaPago.Date >= fechaDesde.Date &&
+                       p.FechaPago.Date <= fechaHasta.Date);
+
+        var pagos = await query.ToListAsync();
+
+        var reporte = new ReportePagosDto
+        {
+            TotalRecaudado = pagos.Sum(p => p.Monto),
+            TotalPagos = pagos.Count,
+            TotalTarjeta = pagos.Where(p => p.MetodoPago == "Tarjeta").Sum(p => p.Monto),
+            TotalEfectivo = pagos.Where(p => p.MetodoPago == "Efectivo").Sum(p => p.Monto),
+            TotalCompletos = pagos.Where(p => p.TipoPago == "Completo").Sum(p => p.Monto),
+            TotalParciales = pagos.Where(p => p.TipoPago == "Parcial").Sum(p => p.Monto),
+            TotalRestantes = pagos.Where(p => p.TipoPago == "Restante").Sum(p => p.Monto),
+            PagosPorDia = pagos.GroupBy(p => p.FechaPago.Date)
+                .Select(g => new PagoPorDiaDto
+                {
+                    Fecha = g.Key.ToString("yyyy-MM-dd"),
+                    Total = g.Sum(p => p.Monto)
+                })
+                .OrderBy(x => x.Fecha)
+                .ToList(),
+            PagosPorServicio = pagos.Where(p => p.Cita?.Servicio != null)
+                .GroupBy(p => p.Cita!.Servicio!.Nombre)
+                .Select(g => new PagoPorServicioDto
+                {
+                    Servicio = g.Key,
+                    Total = g.Sum(p => p.Monto),
+                    Cantidad = g.Count()
+                })
+                .OrderByDescending(x => x.Total)
+                .ToList()
+        };
+
+        return reporte;
+    }
+
+    public async Task<List<Cita>> GetCitasPendientesPagoAsync()
+    {
+        return await _unitOfWork.Citas.GetAll()
+            .Include(c => c.Mascota)
+                .ThenInclude(m => m.Usuario)
+            .Include(c => c.Servicio)
+            .Include(c => c.Veterinario)
+            .Where(c => c.EstadoPago != "Pagado" && c.Estado == "Completada")
+            .OrderBy(c => c.FechaHora)
+            .ToListAsync();
+    }
+
+    public async Task<Cita?> GetCitaForPagoAsync(int citaId)
+    {
+        return await _unitOfWork.Citas.GetAll()
+            .Include(c => c.Mascota).ThenInclude(m => m.Usuario)
+            .Include(c => c.Servicio)
+            .Include(c => c.Veterinario)
+            .FirstOrDefaultAsync(c => c.Id == citaId);
+    }
+
+    public async Task<TarjetaGuardada?> GetTarjetaGuardadaAsync(int usuarioId)
+    {
+        return await _unitOfWork.TarjetasGuardadas.GetAll()
+            .Where(t => t.UsuarioId == usuarioId && t.Activa)
+            .OrderByDescending(t => t.FechaRegistro)
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<Pago> ProcesarPagoTarjetaAsync(int citaId, decimal montoTotal, decimal montoPagar, string tipoPago, string numeroTarjeta, bool guardarTarjeta, string nombreTitular, string fechaVencimiento, string cvv, int? usuarioId)
+    {
+        var referencia = $"PAG-{DateTime.Now:yyyyMMdd}-{citaId:D4}-{new Random().Next(1000, 9999)}";
+
+        var pago = new Pago
+        {
+            CitaId = citaId,
+            Monto = montoPagar,
+            MetodoPago = "Tarjeta",
+            TipoPago = tipoPago,
+            Referencia = referencia,
+            UltimosDigitosTarjeta = numeroTarjeta.Substring(numeroTarjeta.Length - 4),
+            FechaPago = DateTime.Now
+        };
+
+        await _unitOfWork.Pagos.AddAsync(pago);
+
+        var cita = await _unitOfWork.Citas.GetByIdAsync(citaId);
+        if (cita != null)
+        {
+            cita.MontoTotal = montoTotal;
+            cita.MontoPagado += montoPagar; // Acumular en vez de sobreescribir
+            cita.TipoPago = tipoPago;
+            cita.EstadoPago = cita.MontoPagado >= cita.MontoTotal ? "Pagado" : "Parcial";
+            if (cita.Estado != "Completada")
+            {
+                cita.Estado = "Confirmada";
+            }
+            _unitOfWork.Citas.Update(cita);
+        }
+
+        if (guardarTarjeta && usuarioId.HasValue)
+        {
+            var tarjetaExistente = await _unitOfWork.TarjetasGuardadas.GetAll()
+                .Where(t => t.UsuarioId == usuarioId.Value && t.Activa)
+                .FirstOrDefaultAsync();
+
+            if (tarjetaExistente != null)
+            {
+                tarjetaExistente.NombreTitular = EncriptarDatos(nombreTitular);
+                tarjetaExistente.NumeroTarjetaEncriptado = EncriptarDatos(numeroTarjeta);
+                tarjetaExistente.UltimosDigitos = numeroTarjeta.Substring(numeroTarjeta.Length - 4);
+                tarjetaExistente.FechaExpiracion = fechaVencimiento;
+                tarjetaExistente.CVVEncriptado = string.Empty; // CVV nunca se almacena (PCI-DSS)
+                tarjetaExistente.FechaRegistro = DateTime.UtcNow;
+                _unitOfWork.TarjetasGuardadas.Update(tarjetaExistente);
+            }
+            else
+            {
+                var nuevaTarjeta = new TarjetaGuardada
+                {
+                    UsuarioId = usuarioId.Value,
+                    NombreTitular = EncriptarDatos(nombreTitular),
+                    NumeroTarjetaEncriptado = EncriptarDatos(numeroTarjeta),
+                    UltimosDigitos = numeroTarjeta.Substring(numeroTarjeta.Length - 4),
+                    FechaExpiracion = fechaVencimiento,
+                    CVVEncriptado = string.Empty, // CVV nunca se almacena (PCI-DSS)
+                    Activa = true
+                };
+                await _unitOfWork.TarjetasGuardadas.AddAsync(nuevaTarjeta);
+            }
+        }
+
+        await _unitOfWork.CommitAsync();
+
+        return pago;
+    }
+
+    public async Task<Pago> ProcesarPagoRestanteTarjetaAsync(int citaId, string numeroTarjeta)
+    {
+        var cita = await _unitOfWork.Citas.GetByIdAsync(citaId)
+            ?? throw new InvalidOperationException($"Cita {citaId} no encontrada.");
+        var montoRestante = cita.MontoTotal - cita.MontoPagado;
+        var referencia = $"PAG-{DateTime.Now:yyyyMMdd}-{citaId:D4}-{new Random().Next(1000, 9999)}";
+
+        var pago = new Pago
+        {
+            CitaId = citaId,
+            Monto = montoRestante,
+            MetodoPago = "Tarjeta",
+            TipoPago = "Restante",
+            Referencia = referencia,
+            UltimosDigitosTarjeta = numeroTarjeta.Substring(12),
+            FechaPago = DateTime.Now
+        };
+
+        await _unitOfWork.Pagos.AddAsync(pago);
+
+        cita.MontoPagado = cita.MontoTotal;
+        cita.EstadoPago = "Pagado";
+
+        _unitOfWork.Citas.Update(cita);
+        await _unitOfWork.CommitAsync();
+
+        return pago;
+    }
+
+    public async Task<Pago?> GetPagoByIdAsync(int pagoId)
+    {
+        return await _unitOfWork.Pagos.GetByIdAsync(pagoId);
+    }
+
+    public async Task<(bool Success, string Message)> AnularPagoAsync(int pagoId, string motivo)
+    {
+        var pago = await _unitOfWork.Pagos.GetAll()
+            .Include(p => p.Cita)
+            .FirstOrDefaultAsync(p => p.Id == pagoId);
+
+        if (pago == null)
+            return (false, "Pago no encontrado.");
+
+        if (pago.TipoPago == "Anulado")
+            return (false, "Este pago ya fue anulado.");
+
+        // Restar monto del pago a la cita
+        var cita = pago.Cita;
+        if (cita != null)
+        {
+            cita.MontoPagado -= pago.Monto;
+            if (cita.MontoPagado < 0) cita.MontoPagado = 0;
+            cita.EstadoPago = cita.MontoPagado <= 0 ? "Pendiente" : "Parcial";
+            _unitOfWork.Citas.Update(cita);
+        }
+
+        pago.TipoPago = "Anulado";
+        pago.Referencia = $"{pago.Referencia} [ANULADO: {motivo}]";
+        _unitOfWork.Pagos.Update(pago);
+
+        await _unitOfWork.CommitAsync();
+
+        // Registrar acción en la auditoría (RNF-09)
+        await _auditoriaService.RegistrarAccionAsync(
+            "Anular Pago",
+            "Pago",
+            pago.Id.ToString(),
+            $"Pago de S/. {pago.Monto} anulado. Motivo: {motivo}. Cita asociada ID: {pago.CitaId}"
+        );
+
+        return (true, $"Pago #{pago.Id} anulado correctamente.");
+    }
+
+    public async Task<List<Pago>> GetPagosPorUsuarioAsync(int usuarioId)
+    {
+        return await _unitOfWork.Pagos.GetAll()
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Servicio)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Veterinario)
+            .Include(p => p.Cita)
+                .ThenInclude(c => c.Mascota)
+            .Where(p => p.Cita.Mascota.UsuarioId == usuarioId)
+            .OrderByDescending(p => p.FechaPago)
+            .ToListAsync();
+    }
+
+    public async Task<(bool Success, Pago? Pago, string? Error)> RegistrarCobroManualAsync(int citaId, decimal montoTotalAjustado, decimal montoAbonado, string metodoPago, string? referencia, string? observacion, string usuarioOperador)
+    {
+        if (montoAbonado <= 0)
+            return (false, null, "El monto abonado no puede ser cero o negativo.");
+
+        if (montoTotalAjustado <= 0)
+            return (false, null, "El monto total ajustado no puede ser cero o negativo.");
+
+        var metodosValidos = new[] { "Efectivo", "Tarjeta", "Transferencia", "Yape", "Plin" };
+        if (!metodosValidos.Contains(metodoPago))
+            return (false, null, "El método de pago no es válido.");
+
+        var cita = await _unitOfWork.Citas.GetByIdAsync(citaId);
+        if (cita == null)
+            return (false, null, "Cita no encontrada.");
+
+        if (cita.Estado != "Completada")
+            return (false, null, "Solo se pueden registrar cobros en citas en estado 'Completada'.");
+
+        if (cita.EstadoPago == "Pagado")
+            return (false, null, "La cita ya se encuentra totalmente pagada.");
+
+        // Regla 4: Precio final diferente debe justificarse
+        var montoOriginal = cita.Servicio?.Precio ?? cita.MontoTotal;
+        if (montoTotalAjustado != montoOriginal && string.IsNullOrWhiteSpace(observacion))
+            return (false, null, "Debe ingresar una observación justificando el cambio de precio total.");
+
+        // Calcular nuevo monto total
+        cita.MontoTotal = montoTotalAjustado;
+
+        var tipoPago = "Completo";
+        if (cita.MontoPagado + montoAbonado < cita.MontoTotal)
+            tipoPago = "Parcial";
+        else if (cita.MontoPagado > 0)
+            tipoPago = "Restante";
+
+        var refGenerada = string.IsNullOrWhiteSpace(referencia)
+            ? $"COB-{DateTime.Now:yyyyMMdd}-{citaId:D4}-{new Random().Next(1000, 9999)}"
+            : referencia;
+
+        var pago = new Pago
+        {
+            CitaId = citaId,
+            Monto = montoAbonado,
+            MetodoPago = metodoPago,
+            TipoPago = tipoPago,
+            Referencia = refGenerada,
+            Observacion = observacion,
+            FechaPago = DateTime.Now
+        };
+
+        await _unitOfWork.Pagos.AddAsync(pago);
+
+        cita.MontoPagado += montoAbonado;
+        cita.TipoPago = tipoPago;
+        cita.EstadoPago = cita.MontoPagado >= cita.MontoTotal ? "Pagado" : "Parcial";
+
+        _unitOfWork.Citas.Update(cita);
+        await _unitOfWork.CommitAsync();
+
+        await _auditoriaService.RegistrarAccionAsync(
+            "Registrar Cobro Manual",
+            "Pago",
+            pago.Id.ToString(),
+            $"Cobro manual de S/. {pago.Monto} registrado por {usuarioOperador}. Medio: {metodoPago}. Cita ID: {pago.CitaId}"
+        );
+
+        return (true, pago, null);
+    }
+
+    private static string EncriptarDatos(string texto)
+    {
+        if (string.IsNullOrEmpty(texto)) return string.Empty;
+        // Hash SHA256 — no reversible, adecuado para datos sensibles que no necesitan ser leídos de vuelta
+        var bytes = System.Text.Encoding.UTF8.GetBytes(texto);
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToBase64String(hash);
+    }
+}
