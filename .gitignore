@@ -1,0 +1,16 @@
+# IDE & Agent state
+.gemini/
+.ai-context/
+.atl/
+.vs/
+.idea/
+*.user
+
+# Build outputs & node_modules
+bin/
+obj/
+node_modules/
+dist/
+build/
+.env
+.env.local
